@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>SAP 수탁고·누적손익 집계 툴</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  /* 참고용 스타일 — 일부 미리보기 환경에서 무시될 수 있어 핵심 레이아웃은 인라인 style로 이중 적용함 */
+  .skt-drop:hover{border-color:#2f6fed !important;background:#f1f6ff !important;}
+  .skt-drop.skt-dragover{border-color:#2f6fed !important;background:#eaf1ff !important;}
+  .skt-dl:hover{background:#2358c4 !important;}
+  .skt-tbl tbody tr:hover{background:#f7f9fd;}
+  @media (max-width:860px){.skt-grid{grid-template-columns:1fr !important;}}
+</style>
+</head>
+<body style="margin:0;font-family:'Malgun Gothic','Segoe UI',sans-serif;background:#f4f6fa;color:#1b2434;box-sizing:border-box;">
+<div class="skt-app" style="box-sizing:border-box;">
+
+<header style="background:linear-gradient(135deg,#132a52,#1c3a6e);color:#fff;padding:28px 32px;box-sizing:border-box;">
+  <h1 style="margin:0 0 4px;font-size:20px;">SAP 수탁고 · 누적손익 집계 툴</h1>
+  <p style="margin:0;font-size:13px;opacity:.85;">흥국생명 / 흥국화재 · 일반계정 / 특별계정 &nbsp;·&nbsp; SAP 포지션 익스포트(XLSX) 업로드 시 자동 집계됩니다. 모든 계산은 브라우저 내에서만 이루어지며 파일이 외부로 전송되지 않습니다.</p>
+</header>
+
+<main style="max-width:1180px;margin:0 auto;padding:24px 20px 60px;box-sizing:border-box;">
+
+  <div class="skt-grid" id="uploadGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;box-sizing:border-box;"></div>
+
+  <div style="background:#fff;border:1px solid #e2e6ee;border-radius:10px;padding:18px 20px;margin:16px 0;box-sizing:border-box;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <h2 style="margin:0;font-size:16px;color:#132a52;">집계 결과</h2>
+      <button class="skt-dl" id="downloadBtn" style="background:#2f6fed;color:#fff;border:none;padding:8px 14px;border-radius:6px;font-size:12px;cursor:pointer;box-sizing:border-box;">CSV 다운로드</button>
+    </div>
+    <div id="summaryWrap" style="overflow-x:auto;"><div style="color:#6b7686;font-size:12px;padding:14px 0;">파일을 업로드하면 결과가 표시됩니다.</div></div>
+  </div>
+
+  <div id="ruleNote" style="font-size:11.5px;color:#6b7686;line-height:1.7;background:#fff;border:1px solid #e2e6ee;border-radius:8px;padding:14px 16px;box-sizing:border-box;"></div>
+</main>
+</div>
+
+<script>
+/* ---------------- 계정 정의 ---------------- */
+const ACCOUNTS = [
+  { key:"life_general",  company:"흥국생명", accountType:"일반계정", format:"life"  },
+  { key:"life_special",  company:"흥국생명", accountType:"특별계정", format:"life"  },
+  { key:"fire_general",  company:"흥국화재", accountType:"일반계정", format:"fire"  },
+  { key:"fire_special",  company:"흥국화재", accountType:"특별계정", format:"fire"  },
+];
+
+const results = {}; // key -> {face,book,amort,evalPnl,fxPnl,included,total,exclBreakdown,warnings,fileName}
+
+/* ---------------- 헤더 매핑 ---------------- */
+// 흥국생명 (SAP CoCode/포트폴리오 형식)
+const LIFE_COLS = {
+  assetType: "자산구분명",
+  face:      "액면 금액(원화)",
+  book:      "장부금액(원화)",
+  amort:     "상각후장부금액(원화)",
+  evalPnl:   "누적평가손익(원화)",
+  fxPnl:     "누적외화환산손익(원화)",
+};
+// 흥국화재 (SAP 회사코드/계정구분 형식)
+const FIRE_COLS = {
+  group:     "상품그룹",
+  acctType:  "계정구분",
+  posCcy:    "포지션통화",
+  faceFx:    "액면금액 (외화)",
+  bookRate:  "장부환율",
+  book:      "기말장부가(원화)",
+  amort:     "상각후장부금액(원화)",
+  evalPnl:   "누적평가손익(원화)",
+  capAdj:    "누적평가자본조정손익(원화)",
+  fxPnl:     "누적외화환산손익",
+};
+
+function buildHeaderMap(headerRow){
+  const map = {};
+  headerRow.forEach((h,i)=>{
+    if(h===undefined||h===null) return;
+    const key = String(h).trim();
+    if(key && !(key in map)) map[key]=i;
+  });
+  return map;
+}
+function findCol(map, name){
+  if(name in map) return map[name];
+  const target = name.replace(/\s/g,"");
+  for(const k in map){
+    if(k.replace(/\s/g,"")===target) return map[k];
+  }
+  return undefined;
+}
+function num(v){
+  if(v===undefined||v===null||v==="") return 0;
+  if(typeof v==="number") return v;
+  const n = parseFloat(String(v).replace(/,/g,""));
+  return isNaN(n)?0:n;
+}
+
+/* ---------------- 회사별 파서 ---------------- */
+function parseLife(rows, headerMap, warnings){
+  const c = {};
+  for(const k in LIFE_COLS){
+    c[k] = findCol(headerMap, LIFE_COLS[k]);
+    if(c[k]===undefined) warnings.push(`'${LIFE_COLS[k]}' 열을 찾지 못했습니다.`);
+  }
+  let face=0, book=0, amort=0, evalPnl=0, fxPnl=0, included=0;
+  const exclBreakdown = {};
+  for(let r=1; r<rows.length; r++){
+    const row = rows[r];
+    if(!row || row.length===0) continue;
+    const assetType = c.assetType!==undefined ? String(row[c.assetType]||"").trim() : "";
+    if(assetType === "채권"){
+      face    += num(row[c.face]);
+      book    += num(row[c.book]);
+      amort   += num(row[c.amort]);
+      evalPnl += num(row[c.evalPnl]);
+      fxPnl   += num(row[c.fxPnl]);
+      included++;
+    } else if(assetType){
+      exclBreakdown[assetType] = (exclBreakdown[assetType]||0)+1;
+    }
+  }
+  return {face, book, amort, evalPnl, fxPnl, included, total: rows.length-1, exclBreakdown};
+}
+
+function parseFire(rows, headerMap, accountType, warnings){
+  const c = {};
+  for(const k in FIRE_COLS){
+    c[k] = findCol(headerMap, FIRE_COLS[k]);
+    if(c[k]===undefined) warnings.push(`'${FIRE_COLS[k]}' 열을 찾지 못했습니다.`);
+  }
+  let face=0, book=0, amort=0, evalPnl=0, fxPnl=0, included=0;
+  const exclBreakdown = {};
+  for(let r=1; r<rows.length; r++){
+    const row = rows[r];
+    if(!row || row.length===0) continue;
+    const group = c.group!==undefined ? String(row[c.group]||"").trim() : "";
+    const acct  = c.acctType!==undefined ? String(row[c.acctType]||"").trim() : "";
+
+    const isBond = group === "채권";
+    const acctOk = accountType==="특별계정" ? true : (acct === "일반계정");
+
+    if(isBond && acctOk){
+      const faceFx = num(row[c.faceFx]);
+      let rate = num(row[c.bookRate]);
+      const posCcy = c.posCcy!==undefined ? String(row[c.posCcy]||"").trim() : "";
+      if(posCcy === "JPY") rate = rate/100; // 엔화 100엔 단위 고시 보정
+      face    += faceFx * rate;
+      book    += num(row[c.book]);
+      amort   += num(row[c.amort]);
+      // FVPL은 누적평가손익, FVOCI는 누적평가자본조정손익으로 잡히므로 합산해야 함
+      evalPnl += num(row[c.evalPnl]) + num(row[c.capAdj]);
+      fxPnl   += num(row[c.fxPnl]);
+      included++;
+    } else if(group){
+      const label = isBond ? `계정구분:${acct||"(공백)"}` : `상품그룹:${group}`;
+      exclBreakdown[label] = (exclBreakdown[label]||0)+1;
+    }
+  }
+  return {face, book, amort, evalPnl, fxPnl, included, total: rows.length-1, exclBreakdown};
+}
+
+/* ---------------- 업로드 UI 렌더링 ---------------- */
+const grid = document.getElementById("uploadGrid");
+ACCOUNTS.forEach(acc=>{
+  const card = document.createElement("div");
+  card.style.cssText = "background:#fff;border:1px solid #e2e6ee;border-radius:10px;padding:18px 20px;box-sizing:border-box;";
+  card.innerHTML = `
+    <h2 style="font-size:14px;margin:0 0 2px;color:#1c3a6e;">${acc.company} · ${acc.accountType}</h2>
+    <div style="font-size:12px;color:#6b7686;margin-bottom:12px;">${acc.format==="life" ? "SAP CoCode/포트폴리오 형식 (예: 260731_EXPORT_*.XLSX)" : "SAP 회사코드/계정구분 형식 (예: export_260731_*.XLSX)"}</div>
+    <label class="skt-drop" id="drop_${acc.key}" style="display:block;border:1.5px dashed #b7c2d8;border-radius:8px;padding:16px;text-align:center;font-size:13px;color:#6b7686;cursor:pointer;background:#fafbfd;box-sizing:border-box;">
+      클릭 또는 파일을 이 영역으로 드래그하여 업로드
+      <input type="file" id="file_${acc.key}" accept=".xlsx,.xls" style="display:none;">
+      <div class="filename" id="fname_${acc.key}" style="margin-top:8px;font-size:12px;color:#1c3a6e;font-weight:600;word-break:break-all;"></div>
+    </label>
+    <div id="status_${acc.key}" style="margin-top:10px;font-size:12px;line-height:1.6;"></div>
+  `;
+  grid.appendChild(card);
+
+  const dropEl = card.querySelector(`#drop_${acc.key}`);
+  const input = card.querySelector(`#file_${acc.key}`);
+
+  input.addEventListener("change", e=>{
+    const f = e.target.files[0];
+    if(f) handleFile(f, acc);
+  });
+
+  ["dragenter","dragover"].forEach(evt=>{
+    dropEl.addEventListener(evt, e=>{
+      e.preventDefault(); e.stopPropagation();
+      dropEl.classList.add("skt-dragover");
+      dropEl.style.borderColor = "#2f6fed";
+      dropEl.style.background = "#eaf1ff";
+    });
+  });
+  ["dragleave","drop"].forEach(evt=>{
+    dropEl.addEventListener(evt, e=>{
+      e.preventDefault(); e.stopPropagation();
+      dropEl.classList.remove("skt-dragover");
+      dropEl.style.borderColor = "#b7c2d8";
+      dropEl.style.background = "#fafbfd";
+    });
+  });
+  dropEl.addEventListener("drop", e=>{
+    const dt = e.dataTransfer;
+    if(dt && dt.files && dt.files.length){
+      handleFile(dt.files[0], acc);
+    }
+  });
+});
+
+function handleFile(file, acc){
+  document.getElementById(`fname_${acc.key}`).textContent = file.name;
+  const statusEl = document.getElementById(`status_${acc.key}`);
+  statusEl.innerHTML = `<span style="color:#b8860b;">읽는 중…</span>`;
+
+  const reader = new FileReader();
+  reader.onload = e=>{
+    try{
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, {type:"array"});
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:""});
+      const headerMap = buildHeaderMap(rows[0]||[]);
+      const warnings = [];
+
+      const r = acc.format==="life"
+        ? parseLife(rows, headerMap, warnings)
+        : parseFire(rows, headerMap, acc.accountType, warnings);
+
+      results[acc.key] = {...r, warnings, fileName:file.name};
+      renderStatus(acc.key, statusEl);
+      renderSummary();
+    }catch(err){
+      statusEl.innerHTML = `<span style="color:#c0392b;">파일을 읽지 못했습니다: ${err.message}</span>`;
+      delete results[acc.key];
+      renderSummary();
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function renderStatus(key, el){
+  const r = results[key];
+  let html = `<span style="color:#1a7f4e;">포함 ${r.included.toLocaleString()}건</span> / 전체 ${r.total.toLocaleString()}건`;
+  if(r.warnings.length){
+    html += `<div style="color:#c0392b;">${r.warnings.join("<br>")}</div>`;
+  }
+  const exclKeys = Object.keys(r.exclBreakdown);
+  if(exclKeys.length){
+    html += `<div style="font-size:11.5px;color:#6b7686;margin-top:6px;">제외: ` +
+      exclKeys.map(k=>`<span style="display:inline-block;background:#f2f2f2;border-radius:8px;padding:1px 7px;margin:2px 3px 0 0;">${k} ${r.exclBreakdown[k]}건</span>`).join("") +
+      `</div>`;
+  }
+  el.innerHTML = html;
+}
+
+/* ---------------- 결과 요약 렌더링 ---------------- */
+function fmt(n){
+  const sign = n<0 ? "-" : "";
+  const abs = Math.abs(Math.round(n));
+  return sign + abs.toLocaleString("ko-KR");
+}
+function eok(n){
+  return Math.round(n/100000000).toLocaleString("ko-KR") + "억";
+}
+function td(v, extraColor){
+  const color = extraColor ? (v<0?'#c0392b':'#1a7f4e') : '#1b2434';
+  return `<td style="padding:9px 10px;border-bottom:1px solid #e2e6ee;text-align:right;white-space:nowrap;color:${color};">${fmt(v)}<br><span style="font-size:11px;color:#9aa3b2;">${eok(v)}</span></td>`;
+}
+
+function renderSummary(){
+  const keys = ACCOUNTS.map(a=>a.key).filter(k=>results[k]);
+  const wrap = document.getElementById("summaryWrap");
+  if(keys.length===0){
+    wrap.innerHTML = `<div style="color:#6b7686;font-size:12px;padding:14px 0;">파일을 업로드하면 결과가 표시됩니다.</div>`;
+    return;
+  }
+
+  let totFace=0, totBook=0, totAmort=0, totEval=0, totFx=0;
+  let bodyRows = "";
+  ACCOUNTS.forEach(acc=>{
+    const r = results[acc.key];
+    if(!r) return;
+    totFace+=r.face; totBook+=r.book; totAmort+=r.amort; totEval+=r.evalPnl; totFx+=r.fxPnl;
+    bodyRows += `
+      <tr>
+        <td style="padding:9px 10px;border-bottom:1px solid #e2e6ee;text-align:left;white-space:nowrap;">
+          ${acc.company} ${acc.accountType}<br>
+          <span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;background:#eef2fb;color:#1c3a6e;margin-top:3px;">${r.fileName}</span>
+        </td>
+        ${td(r.face)}
+        ${td(r.book)}
+        ${td(r.amort)}
+        ${td(r.evalPnl, true)}
+        ${td(r.fxPnl, true)}
+      </tr>`;
+  });
+
+  wrap.innerHTML = `
+    <table class="skt-tbl" style="width:100%;border-collapse:collapse;font-size:13px;min-width:820px;">
+      <thead>
+        <tr style="background:#eef2f8;">
+          <th style="padding:9px 10px;text-align:left;color:#1c3a6e;font-size:12px;">계정</th>
+          <th style="padding:9px 10px;text-align:right;color:#1c3a6e;font-size:12px;">액면가 기준(원)</th>
+          <th style="padding:9px 10px;text-align:right;color:#1c3a6e;font-size:12px;">장부금액 기준(원)</th>
+          <th style="padding:9px 10px;text-align:right;color:#1c3a6e;font-size:12px;">상각후원가 기준(원)</th>
+          <th style="padding:9px 10px;text-align:right;color:#1c3a6e;font-size:12px;">누적평가손익(원화)</th>
+          <th style="padding:9px 10px;text-align:right;color:#1c3a6e;font-size:12px;">누적외화환산손익(원화)</th>
+        </tr>
+      </thead>
+      <tbody>${bodyRows}</tbody>
+      <tfoot>
+        <tr style="font-weight:700;background:#f4f7fc;border-top:2px solid #1c3a6e;">
+          <td style="padding:9px 10px;text-align:left;">합계</td>
+          ${td(totFace)}
+          ${td(totBook)}
+          ${td(totAmort)}
+          ${td(totEval, true)}
+          ${td(totFx, true)}
+        </tr>
+      </tfoot>
+    </table>`;
+}
+
+document.getElementById("downloadBtn").addEventListener("click", ()=>{
+  const keys = ACCOUNTS.map(a=>a.key).filter(k=>results[k]);
+  if(keys.length===0){ alert("업로드된 파일이 없습니다."); return; }
+  let csv = "계정,파일명,액면가 기준(원),장부금액 기준(원),상각후원가 기준(원),누적평가손익(원화),누적외화환산손익(원화)\n";
+  let totFace=0, totBook=0, totAmort=0, totEval=0, totFx=0;
+  ACCOUNTS.forEach(acc=>{
+    const r = results[acc.key];
+    if(!r) return;
+    totFace+=r.face; totBook+=r.book; totAmort+=r.amort; totEval+=r.evalPnl; totFx+=r.fxPnl;
+    csv += `${acc.company} ${acc.accountType},${r.fileName},${Math.round(r.face)},${Math.round(r.book)},${Math.round(r.amort)},${Math.round(r.evalPnl)},${Math.round(r.fxPnl)}\n`;
+  });
+  csv += `합계,,${Math.round(totFace)},${Math.round(totBook)},${Math.round(totAmort)},${Math.round(totEval)},${Math.round(totFx)}\n`;
+
+  const blob = new Blob(["﻿"+csv], {type:"text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const today = new Date().toISOString().slice(0,10).replace(/-/g,"");
+  a.href = url; a.download = `수탁고_누적손익_집계_${today}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+document.getElementById("ruleNote").innerHTML = `
+  <b style="color:#1c3a6e;">집계 규칙</b><br>
+  · 흥국생명(CoCode/포트폴리오 형식): '자산구분명' = <b>채권</b> 행만 포함하여 액면 금액(원화)/장부금액(원화)/상각후장부금액(원화)/누적평가손익(원화)/누적외화환산손익(원화)를 합산합니다.<br>
+  · 흥국화재(회사코드/계정구분 형식): '상품그룹' = <b>채권</b> 행만 포함합니다 (FX·CRS 통화스왑 등 제외). 일반계정 파일은 '계정구분' = <b>일반계정</b> 행만, 특별계정 파일은 계정구분 구분 없이 전체 포함합니다.<br>
+  · 흥국화재 액면가(원화) = 액면금액(외화) × 장부환율. 단 포지션통화 = <b>JPY</b>인 종목은 장부환율을 100으로 나눈 값을 사용합니다 (엔화 100엔당 고시 관행 보정).<br>
+  · 누적손익은 <b>누적평가손익(원화)</b>와 <b>누적외화환산손익(원화)</b>를 별도 항목으로 표시합니다 (둘은 합산하지 않음).<br>
+  · 흥국화재는 회계분류상 FVPL 종목은 누적평가손익, FVOCI 종목은 누적자본조정손익으로 잡히므로, 표의 '누적평가손익(원화)'는 누적평가손익(원화) + 누적평가자본조정손익(원화)을 합산한 값입니다. 흥국생명은 회계분류와 무관하게 단일 누적평가손익 컬럼을 그대로 사용합니다.<br>
+  · 파일은 서버로 전송되지 않고 브라우저 안에서만 계산됩니다. 열 이름이 예시와 다르면 상단 상태창에 오류로 표시됩니다.
+`;
+</script>
+</body>
+</html>
